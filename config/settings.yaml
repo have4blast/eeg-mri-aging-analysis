@@ -1,0 +1,35 @@
+# ================================================
+# EEG Preprocessing Settings (MNE-Python)
+# YAML version corresponding to parser.py options
+# ================================================
+
+# ------------------------------------------------
+# Filtering settings
+# ------------------------------------------------
+paths:
+  eeg_raw: "data/eeg/raw/"
+  dti_raw: "data/dti/raw/"
+  output_root: "outputs/"
+  subjects_csv: "metadata/subjects.csv"
+
+# ------------------------------------------------
+# Filtering settings
+# ------------------------------------------------
+pipeline:
+  use_eeg: true
+  use_dti: true
+  use_stats: true
+
+# ------------------------------------------------
+# Filtering settings
+# ------------------------------------------------
+configs:
+  eeg: "config/eeg.yaml"
+  dti: "config/dti.yaml"
+
+# ------------------------------------------------
+# Filtering settings
+# ------------------------------------------------
+global:
+  random_seed: 42
+  device: "cpu"

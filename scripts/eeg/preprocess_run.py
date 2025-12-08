@@ -1,5 +1,7 @@
 import os
 import gc
+import numpy as np
+import pandas as pd
 import logging
 from scripts.eeg import preprocess
 
@@ -49,6 +51,7 @@ def process_subject(args, subject_id):
 
         # Divide into EO and EC
         raw_eo, raw_ec = preprocess.divide_conditions(raw)
+        
 
         # Filter both conditions
         raw_eo = preprocess.filter_data(args, raw_eo)
@@ -56,9 +59,9 @@ def process_subject(args, subject_id):
 
         # Apply ICA if specified
         #if args.ica:
-        #    logger.info(f'Applying ICA for subject {subject_id}')
-        #    raw_eo = preprocess.apply_ica(raw_eo, args, subject_id, condition='EO')
-        #    raw_ec = preprocess.apply_ica(raw_ec, args, subject_id, condition='EC')
+        logger.info(f'Applying ICA for subject {subject_id}')
+        raw_eo, ica_eo = preprocess.apply_ica(args, raw_eo, 'EO', subject_id)
+        raw_ec, ica_ec = preprocess.apply_ica(args, raw_ec, 'EC', subject_id)
 
         # Save preprocessed data
         preprocess.save_raw(raw_eo, args.preprocess_path, subject_id, condition='EO')

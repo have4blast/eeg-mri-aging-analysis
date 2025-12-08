@@ -37,6 +37,10 @@ def get_parser():
                         help='Path to save PSI results')
     parser.add_argument('--connectivity_path', type=str, default = 'D:\\FY2025\\Fukuyama\\work place\\eeg-mri-aging-analysis\\data\\results\\connectivity\\', 
                         help='Path to save connectivity results')
+    parser.add_argument('--metadata_path', type=str, default = 'D:\\FY2025\\Fukuyama\\work place\\eeg-mri-aging-analysis\\metadata\\Participants_MPILMBB_LEMON.csv', 
+                            help='Path to the metadata CSV file')
+    parser.add_argument('--pair_result_path', type=str, default = 'D:\\FY2025\\Fukuyama\\work place\\eeg-mri-aging-analysis\\data\\results\\pairwise\\', 
+                        help='Path to save pairwise results')
 
     # Optional preprocessing parameters
     parser.add_argument('--montage', type=str, default='standard_1005',

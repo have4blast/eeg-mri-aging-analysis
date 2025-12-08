@@ -112,6 +112,56 @@ def divide_conditions(raw):
 
     return raw_eo, raw_ec
 
+# def divide_conditions_auto_margin(raw, min_block_sec=0.2):
+#     """    
+#     Divide EEG data into EO/EC blocks while automatically handling edges.
+    
+#     Args:
+#         raw (mne.io.Raw): Loaded EEG data.
+#         min_block_sec (float): Minimum duration of a block to include (seconds).
+        
+#     Returns:
+#         raw_eo, raw_ec (mne.io.Raw or None): Concatenated raw blocks per condition.
+#     """
+#     try:
+#         events, event_id = mne.events_from_annotations(raw)
+#     except Exception as e:
+#         print(f"Could not extract events: {e}")
+#         return None, None
+
+#     fs = raw.info['sfreq']
+#     data_end = raw.times[-1]
+
+#     eo_blocks, ec_blocks = [], []
+
+#     eo_code = event_id.get('Stimulus/S200', -1)
+#     ec_code = event_id.get('Stimulus/S210', -1)
+
+#     for i, event in enumerate(events[:-1]):
+#         t_start = event[0] / fs
+#         t_end = events[i + 1][0] / fs
+#         this_code = event[2]
+#         next_code = events[i + 1][2]
+
+#         # Automatically shrink margins if near edges
+#         t_start_safe = max(t_start, 0)
+#         t_end_safe = min(t_end, data_end)
+
+#         block_duration = t_end_safe - t_start_safe
+#         if block_duration < min_block_sec:
+#             continue  # Skip very short blocks
+
+#         if this_code == eo_code and next_code == eo_code:
+#             eo_blocks.append(raw.copy().crop(tmin=t_start_safe, tmax=t_end_safe, include_tmax=False))
+#         elif this_code == ec_code and next_code == ec_code:
+#             ec_blocks.append(raw.copy().crop(tmin=t_start_safe, tmax=t_end_safe, include_tmax=False))
+
+#     raw_eo = mne.concatenate_raws(eo_blocks) if eo_blocks else None
+#     raw_ec = mne.concatenate_raws(ec_blocks) if ec_blocks else None
+
+#     return raw_eo, raw_ec
+
+
 def filter_data(args, raw):
     """ Apply band-pass filtering to the EEG data.
     Args:
@@ -138,7 +188,7 @@ def filter_data(args, raw):
 def apply_ica(args, raw, condition, id, random_state=97):
 
     # ICA fitting for EO (Eyes Open) or EC (Eyes Closed)
-    ica = mne.preprocessing.ICA(n_components=args.n_components, method=args.method, random_state=random_state)
+    ica = mne.preprocessing.ICA(n_components=args.n_components, method=args.ica_method, random_state=random_state)
     ica.fit(raw)
 
     # Detect and mark EOG artifacts (blink/movement)

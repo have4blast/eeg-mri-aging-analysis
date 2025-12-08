@@ -1,0 +1,58 @@
+# ================================================
+# EEG Preprocessing Settings (MNE-Python)
+# YAML version corresponding to parser.py options
+# ================================================
+
+# ------------------------------------------------
+# Filtering settings
+# ------------------------------------------------
+filter:
+  low_freq: 1.0          # --l_freq
+  high_freq: 40.0        # --h_freq
+  notch_freq: 50.0       # --notch_freq (set null to disable)
+
+# ------------------------------------------------
+# Channel and montage settings
+# ------------------------------------------------
+channels:
+  missing_strategy: "interpolate"   # --missing (interpolate / drop / ignore)
+  ref_ch: "average"                 # --ref_ch (average, or channel list)
+  exclude: []                       # channels to exclude (for preprocessing)
+
+# ------------------------------------------------
+# Epoching settings
+# ------------------------------------------------
+epoch:
+  tmin: -0.2             # --tmin
+  tmax: 0.8              # --tmax
+  baseline: [null, 0]    # --baseline (null means "None")
+
+# ------------------------------------------------
+# ICA
+# ------------------------------------------------
+ica:
+  enable: true           # --ica
+  n_components: 0.99     # --n_components
+  method: "fastica"      # --ica_method
+  random_state: 97       # --random_state
+
+# ------------------------------------------------
+# Artifact removal
+# ------------------------------------------------
+artifacts:
+  reject_eog: true       # --reject_eog
+  reject_emg: false      # (optional)
+  threshold: null        # automatic threshold detection if null
+
+# ------------------------------------------------
+# Saving options
+# ------------------------------------------------
+save:
+  file_format: "fif"     # --save_format
+  overwrite: true        # --overwrite
+
+# ------------------------------------------------
+# Logging / debug
+# ------------------------------------------------
+logging:
+  verbose: false         # --verbose
