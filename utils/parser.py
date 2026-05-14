@@ -74,6 +74,46 @@ def get_parser():
     parser.add_argument('--overwrite', action='store_true',
                         help='Allow overwriting output files')
 
+    # Arguments used by connectivity pipeline (used via getattr in connectivity.py)
+    parser.add_argument('--same_band_only', action='store_false',
+                        help='If set, compute only same-band (b,b) PSI pairs')
+    parser.add_argument('--band_list', type=str, default='delta,theta,alpha,beta',
+                        help='Comma-separated list of bands to analyze (default: delta,theta,alpha,beta)')
+    parser.add_argument('--cycles', type=int, default=6,
+                        help='Number of cycles used to determine window length')
+    parser.add_argument('--overlap', type=float, default=0.5,
+                        help='Window overlap fraction (0.0-1.0)')
+    parser.add_argument('--n_surrogates', type=int, default=5,
+                        help='Number of phase-randomization surrogates to generate (default: 500)')
+    parser.add_argument('--m_max_extra', type=int, default=3,
+                        help='Extra margin when estimating m_max for n:m search')
+    parser.add_argument('--min_win_sec', type=float, default=0.5,
+                        help='Minimum window length in seconds')
+    parser.add_argument('--max_win_sec', type=float, default=10.0,
+                        help='Maximum window length in seconds')
+    parser.add_argument('--random_state', type=int, default=None,
+                        help='Random seed for surrogate generation')
+    parser.add_argument('--alpha', type=float, default=0.05,
+                        help='Significance level for FDR correction')
+    parser.add_argument('--save_surrogates', action='store_true',
+                        help='Save surrogate samples to disk')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose output in processing scripts')
+    parser.add_argument('--show_progress', action='store_true',
+                        help='Show per-surrogate progress bars when running serially (n_jobs=1)')
+    parser.add_argument('--progress_position', type=int, default=0,
+                        help='tqdm progress bar position (useful when stacking bars)')
+
+    # Parallelization / progress options for surrogate computation
+    parser.add_argument('--n_jobs', type=int, default=4,
+                        help='Number of parallel workers for surrogate/pair processing (-1 = all cores)')
+    parser.add_argument('--parallel_backend', type=str, default='loky',
+                        help='Parallel backend to use (e.g. loky, threading)')
+
     args = parser.parse_args()
+
+    # Convert band_list string to Python list if provided as comma-separated string
+    if isinstance(args.band_list, str):
+        args.band_list = [b.strip() for b in args.band_list.split(',') if b.strip()]
 
     return args

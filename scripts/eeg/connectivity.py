@@ -7,6 +7,8 @@ import networkx as nx
 from tqdm import tqdm
 from tqdm import trange
 import pickle
+from joblib import Parallel, delayed
+import concurrent.futures
 
 import mne
 
@@ -596,6 +598,7 @@ def compute_dynamic_measures(
     condition,
     data,               # (n_channels, n_times)
     sfreq,
+    ch_names,
     band_list = ["delta", "theta", "alpha", "beta"],
     cycles = 6,
     overlap = 0.5,
@@ -635,431 +638,754 @@ def compute_dynamic_measures(
         l, h = band_bounds[b]
         filtered_data[b] = fir_filter_data(data, sfreq, l, h)
 
-    # For each pair:
-    for idx1, b1 in enumerate(band_list):
-        for idx2, b2 in enumerate(band_list[idx1:]):
-            # ensure ordered pair (b1,b2) where idx2 >= idx1
-            # we'll store both (b1,b2) and (b2,b1) if needed later
-            if idx1 == idx2:
-                pair_key = (b1, b1)
-            else:
-                pair_key = (b1, b2)
+    # Determine whether to compute only same-band pairs or also cross-band pairs
+    same_band_only = getattr(args, 'same_band_only', True)
 
-            if verbose:
-                print(f"\nProcessing pair {pair_key}")
+    # Build list of pairs to process according to the flag
+    pairs = []
+    if same_band_only:
+        # only same-band (b,b) for each band in band_list
+        for b in band_list:
+            pairs.append((b, b))
+    else:
+        # include same-band and cross-band pairs (upper-triangle ordering)
+        for idx1, b1 in enumerate(band_list):
+            for b2 in band_list[idx1:]:
+                pairs.append((b1, b2))
 
-            data1 = filtered_data[b1]  # (n_ch, n_times)
-            data2 = filtered_data[b2]
+    # For each selected pair:
+    for pair_key in pairs:
+        b1, b2 = pair_key
 
-            # choose window length: if same-band, use that band's win;
-            # if cross-band, use the longer of the two (to capture slow cycles)
+        if verbose:
+            print(f"\nProcessing pair {pair_key}")
+
+        data1 = filtered_data[b1]  # (n_ch, n_times)
+        data2 = filtered_data[b2]
+
+        # choose window length: if same-band, use that band's win;
+        # if cross-band, use the longer of the two (to capture slow cycles)
+        if b1 == b2:
+            win_sec = band_win[b1]
+        else:
+            # use max of both windows to ensure adequate cycles of the lower band
+            win_sec = max(band_win[b1], band_win[b2])
+
+        step_sec = win_sec * (1.0 - overlap)
+        n_win = int(np.floor((n_times / sfreq - win_sec) / step_sec) + 1)
+        if n_win < 1:
+            # fallback: single window
+            n_win = 1
+            step_sec = 0
+        if verbose:
+            print(f"  window {win_sec:.3f}s step {step_sec:.3f}s -> n_win {n_win}")
+
+        # prepare containers
+        psi_windows = np.zeros((n_win, n_ch, n_ch))
+        pli_windows = np.zeros((n_win, n_ch, n_ch))
+        wpli_windows = np.zeros((n_win, n_ch, n_ch))
+        imcoh_windows = np.zeros((n_win, n_ch, n_ch))
+        best_m_windows = []  # per-window best m for cross-band; for same-band keep 1
+
+        # precompute time indices for windows
+        win_samples = int(round(win_sec * sfreq))
+        step_samples = int(round(step_sec * sfreq)) if step_sec > 0 else 0
+        win_centers = []
+
+        for w in trange(n_win, desc=f"{b1}-{b2}", disable=not verbose):
+            start_samp = w * step_samples
+            end_samp = start_samp + win_samples
+            if end_samp > n_times:
+                # pad or clip: clip here
+                start_samp = max(0, n_times - win_samples)
+                end_samp = n_times
+            win_centers.append((start_samp + end_samp) / 2.0 / sfreq)
+
+            x1 = data1[:, start_samp:end_samp]  # (n_ch, win_samples)
+            x2 = data2[:, start_samp:end_samp]
+
+            # analytic signals
+            a1 = hilbert(x1, axis=1)   # complex
+            a2 = hilbert(x2, axis=1)
+
+            # phases (n_ch, win_samples)
+            ph1 = np.angle(a1)
+            ph2 = np.angle(a2)
+
+            # If same band, simple 1:1
             if b1 == b2:
-                win_sec = band_win[b1]
+                for i in range(n_ch):
+                    for j in range(n_ch):
+                        psi_windows[w, i, j] = psi_between_phase(ph1[i], ph2[j])
+                        pli_windows[w, i, j] = pli_between_phase(ph1[i], ph2[j])
+                        wpli_windows[w, i, j] = wpli_between_analytic(a1[i], a2[j])
+                        imcoh_windows[w, i, j] = imag_coherence_between_analytic(a1[i], a2[j])
+                best_m_windows.append(1)
             else:
-                # use max of both windows to ensure adequate cycles of the lower band
-                win_sec = max(band_win[b1], band_win[b2])
-
-            step_sec = win_sec * (1.0 - overlap)
-            n_win = int(np.floor((n_times / sfreq - win_sec) / step_sec) + 1)
-            if n_win < 1:
-                # fallback: single window
-                n_win = 1
-                step_sec = 0
-            if verbose:
-                print(f"  window {win_sec:.3f}s step {step_sec:.3f}s -> n_win {n_win}")
-
-            # prepare containers
-            psi_windows = np.zeros((n_win, n_ch, n_ch))
-            pli_windows = np.zeros((n_win, n_ch, n_ch))
-            wpli_windows = np.zeros((n_win, n_ch, n_ch))
-            imcoh_windows = np.zeros((n_win, n_ch, n_ch))
-            best_m_windows = []  # per-window best m for cross-band; for same-band keep 1
-
-            # precompute time indices for windows
-            win_samples = int(round(win_sec * sfreq))
-            step_samples = int(round(step_sec * sfreq)) if step_sec > 0 else 0
-            win_centers = []
-
-            for w in trange(n_win, desc=f"{b1}-{b2}", disable=not verbose):
-                start_samp = w * step_samples
-                end_samp = start_samp + win_samples
-                if end_samp > n_times:
-                    # pad or clip: clip here
-                    start_samp = max(0, n_times - win_samples)
-                    end_samp = n_times
-                win_centers.append((start_samp + end_samp) / 2.0 / sfreq)
-
-                x1 = data1[:, start_samp:end_samp]  # (n_ch, win_samples)
-                x2 = data2[:, start_samp:end_samp]
-
-                # analytic signals
-                a1 = hilbert(x1, axis=1)   # complex
-                a2 = hilbert(x2, axis=1)
-
-                # phases (n_ch, win_samples)
-                ph1 = np.angle(a1)
-                ph2 = np.angle(a2)
-
-                # If same band, simple 1:1
-                if b1 == b2:
-                    for i in range(n_ch):
-                        for j in range(n_ch):
-                            psi_windows[w, i, j] = psi_between_phase(ph1[i], ph2[j])
-                            pli_windows[w, i, j] = pli_between_phase(ph1[i], ph2[j])
-                            wpli_windows[w, i, j] = wpli_between_analytic(a1[i], a2[j])
-                            imcoh_windows[w, i, j] = imag_coherence_between_analytic(a1[i], a2[j])
-                    best_m_windows.append(1)
+                # cross-band: sweep m for n=1
+                f1c = band_fc[b1]
+                f2c = band_fc[b2]
+                # rough m_max: ceil(f2c/f1c) + margin
+                if f1c == 0:
+                    m_max = 1
                 else:
-                    # cross-band: sweep m for n=1
-                    f1c = band_fc[b1]
-                    f2c = band_fc[b2]
-                    # rough m_max: ceil(f2c/f1c) + margin
-                    if f1c == 0:
+                    m_max = int(np.ceil(f2c / f1c)) + m_max_extra
+                    if m_max < 1:
                         m_max = 1
-                    else:
-                        m_max = int(np.ceil(f2c / f1c)) + m_max_extra
-                        if m_max < 1:
-                            m_max = 1
-                    best_m_for_window = np.ones((n_ch, n_ch), dtype=int) * 1
-                    best_psi_for_window = np.zeros((n_ch, n_ch))
+                best_m_for_window = np.ones((n_ch, n_ch), dtype=int) * 1
+                best_psi_for_window = np.zeros((n_ch, n_ch))
 
-                    # For efficiency: compute phase arrays once per channel pair inside loops
-                    for i in range(n_ch):
-                        for j in range(n_ch):
-                            # sweep m
-                            best_psi = -1.0
-                            best_m = 1
-                            for m in range(1, m_max + 1):
-                                phase_diff = 1 * ph2[j] - m * ph1[i]
-                                psi_val = np.abs(np.mean(np.exp(1j * phase_diff)))
-                                if psi_val > best_psi:
-                                    best_psi = psi_val
-                                    best_m = m
-                            psi_windows[w, i, j] = best_psi
-                            best_m_for_window[i, j] = best_m
-                            # compute other metrics using analytic signals at 1:1 alignment (not n:m):
-                            # For connectivity metrics like wPLI/PLI/imcoh we normally compute narrowband between
-                            # the same filtered signals, so we compute them here (they reflect band-band interactions)
-                            pli_windows[w, i, j] = pli_between_phase(ph1[i], ph2[j])
-                            wpli_windows[w, i, j] = wpli_between_analytic(a1[i], a2[j])
-                            imcoh_windows[w, i, j] = imag_coherence_between_analytic(a1[i], a2[j])
+                # For efficiency: compute phase arrays once per channel pair inside loops
+                for i in range(n_ch):
+                    for j in range(n_ch):
+                        # sweep m
+                        best_psi = -1.0
+                        best_m = 1
+                        for m in range(1, m_max + 1):
+                            phase_diff = 1 * ph2[j] - m * ph1[i]
+                            psi_val = np.abs(np.mean(np.exp(1j * phase_diff)))
+                            if psi_val > best_psi:
+                                best_psi = psi_val
+                                best_m = m
+                        psi_windows[w, i, j] = best_psi
+                        best_m_for_window[i, j] = best_m
+                        # compute other metrics using analytic signals at 1:1 alignment (not n:m):
+                        # For connectivity metrics like wPLI/PLI/imcoh we normally compute narrowband between
+                        # the same filtered signals, so we compute them here (they reflect band-band interactions)
+                        pli_windows[w, i, j] = pli_between_phase(ph1[i], ph2[j])
+                        wpli_windows[w, i, j] = wpli_between_analytic(a1[i], a2[j])
+                        imcoh_windows[w, i, j] = imag_coherence_between_analytic(a1[i], a2[j])
 
-                    # store best_m matrix averaged (or keep full matrix)
-                    # here we store the per-window average best m (rounded) for convenience
-                    best_m_windows.append(best_m_for_window)
+                # store best_m matrix averaged (or keep full matrix)
+                # here we store the per-window average best m (rounded) for convenience
+                best_m_windows.append(best_m_for_window)
 
-            # average across windows
-            psi_mean = np.mean(psi_windows, axis=0)
-            pli_mean = np.mean(pli_windows, axis=0)
-            wpli_mean = np.mean(wpli_windows, axis=0)
-            imcoh_mean = np.mean(imcoh_windows, axis=0)
+        # average across windows
+        psi_mean = np.mean(psi_windows, axis=0)
+        pli_mean = np.mean(pli_windows, axis=0)
+        wpli_mean = np.mean(wpli_windows, axis=0)
+        imcoh_mean = np.mean(imcoh_windows, axis=0)
 
-            results["per_pair"][pair_key] = {
-                "windows": win_centers,
-                "psi_windows": psi_windows,
-                "psi_mean": psi_mean,
-                "pli_windows": pli_windows,
-                "pli_mean": pli_mean,
-                "wpli_windows": wpli_windows,
-                "wpli_mean": wpli_mean,
-                "imcoh_windows": imcoh_windows,
-                "imcoh_mean": imcoh_mean,
-                "best_m_windows": best_m_windows,
-            }
+        results["per_pair"][pair_key] = {
+            "windows": win_centers,
+            "psi_windows": psi_windows,
+            "psi_mean": psi_mean,
+            "pli_windows": pli_windows,
+            "pli_mean": pli_mean,
+            "wpli_windows": wpli_windows,
+            "wpli_mean": wpli_mean,
+            "imcoh_windows": imcoh_windows,
+            "imcoh_mean": imcoh_mean,
+            "best_m_windows": best_m_windows,
+        }
 
-            # if pair was not symmetrical (b1 != b2), also store reversed key for convenience
-            if b1 != b2:
-                results["per_pair"][(b2, b1)] = results["per_pair"][pair_key]
+        # if pair was not symmetrical (b1 != b2), also store reversed key for convenience
+        if b1 != b2:
+            results["per_pair"][(b2, b1)] = results["per_pair"][pair_key]
 
-            filename = f"psi_{pair_key[0]}_{pair_key[1]}_{id}_{condition}.pkl"
-            save_dir_path = os.path.join(args.pair_result_path, id)
+        filename = f"psi_{pair_key[0]}_{pair_key[1]}_{id}_{condition}.pkl"
+        save_dir_path = os.path.join(args.pair_result_path, id)
 
-            os.makedirs(save_dir_path, exist_ok=True)
-            save_path = os.path.join(save_dir_path, filename)
-            with open(save_path, "wb") as f:
-                pickle.dump(results["per_pair"][pair_key], f)
+        os.makedirs(save_dir_path, exist_ok=True)
+        save_path = os.path.join(save_dir_path, filename)
+        with open(save_path, "wb") as f:
+            pickle.dump(results["per_pair"][pair_key], f)
 
-            plot_save_psi_matrix_2(results["per_pair"][pair_key]["psi_mean"], pair_key, data.ch_names, id, condition, args.psi_path)
-            plot_save_psi_matrix_2(results["per_pair"][pair_key]["pli_mean"], pair_key, data.ch_names, id, condition, args.psi_path)
-            plot_save_psi_matrix_2(results["per_pair"][pair_key]["wpli_mean"], pair_key, data.ch_names, id, condition, args.psi_path)
-            plot_save_psi_matrix_2(results["per_pair"][pair_key]["imcoh_mean"], pair_key, data.ch_names, id, condition, args.psi_path)
+        plot_save_psi_matrix_2(results["per_pair"][pair_key], pair_key, ch_names, id, condition, args.psi_path)
 
     return results
 
 def plot_save_psi_matrix_2(psi_matrix, pair_key, ch_names, id, condition, output_path):
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(psi_matrix, xticklabels=ch_names, yticklabels=ch_names,
-            cmap='viridis', center=0, annot=False, fmt=".2f", square=True)
-    plt.title(f'Phase Synchronization Index ({id}, {condition})')
-    plt.xlabel('Channel')
-    plt.ylabel('Channel')
-    plt.tight_layout()
-    
-    subject_dir = os.path.join(output_path, id)
+    for metric in ["psi_mean", "pli_mean", "wpli_mean", "imcoh_mean"]:
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(psi_matrix[metric], xticklabels=ch_names, yticklabels=ch_names,
+                cmap='viridis', center=0, annot=False, fmt=".2f", square=True)
+        plt.title(f'{metric} ({id}, {condition})')
+        plt.xlabel('Channel')
+        plt.ylabel('Channel')
+        plt.tight_layout()
 
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(subject_dir), exist_ok=True)
-    
-    # Save the figure
-    img_filename = os.path.join(subject_dir, f"psi_{pair_key[0]}_{pair_key[1]}_{id}_{condition}.png")
+        # Save the figure
+        subject_dir = os.path.join(output_path, id)
+        os.makedirs(subject_dir, exist_ok=True)
+        img_filename = os.path.join(subject_dir, f"{metric}_{pair_key[0]}_{pair_key[1]}_{id}_{condition}.png")
+        plt.savefig(img_filename, dpi=300)
+        plt.close()
+        print(f"Saved {metric} plot to {img_filename}")
 
-    plt.savefig(img_filename, dpi=300)
-    plt.close()
-    print(f"Saved PSI matrix plot to {img_filename}")
+def _phase_randomize_channel(sig, random_state=None):
+    """Phase-randomize a single real signal while preserving the amplitude spectrum.
+    Returns a real-valued surrogate time series of same length.
+    """
+    n = sig.shape[0]
+    X = np.fft.fft(sig)
+
+    rng = np.random.default_rng(random_state)
+
+    # indices for positive frequencies (exclude DC=0 and Nyquist if present)
+    if n % 2 == 0:
+        pos_idx = np.arange(1, n // 2)
+    else:
+        pos_idx = np.arange(1, (n + 1) // 2)
+
+    phases = rng.uniform(0, 2 * np.pi, size=pos_idx.shape[0])
+
+    # apply random phases to positive freqs and enforce Hermitian symmetry
+    X_sur = X.copy()
+    X_sur[pos_idx] = X[pos_idx] * np.exp(1j * phases)
+    X_sur[-pos_idx] = np.conj(X_sur[pos_idx])
+
+    # leave DC and Nyquist unchanged
+    x_surr = np.fft.ifft(X_sur).real
+    return x_surr
+
+
+def phase_randomize_signals(data, random_state=None):
+    """Phase-randomize multichannel data (n_ch, n_times). Returns surrogate array.
+    """
+    n_ch, n_times = data.shape
+    surr = np.zeros_like(data)
+    for ch in range(n_ch):
+        surr[ch] = _phase_randomize_channel(data[ch], random_state=random_state)
+    return surr
+
+
+# --- Progress plotting utility -------------------------------------------------
+class ProgressPlotter:
+    """Simple progress visualizer that saves a PNG with horizontal bars for each pair.
+
+    Usage:
+      pp = ProgressPlotter(out_dir, pairs)
+      pp.set_total(n_surrogates)
+      pp.update_surrogate(pair_key_str, current_sur, total_sur)
+      pp.mark_pair_done(pair_key_str)
+    """
+    def __init__(self, out_dir, pairs):
+        self.out_dir = out_dir
+        self.pairs = [f"{p[0]}-{p[1]}" for p in pairs]
+        self.progress = {k: 0.0 for k in self.pairs}
+        self.total = None
+        os.makedirs(self.out_dir, exist_ok=True)
+        self.png_path = os.path.join(self.out_dir, 'surrogate_progress.png')
+
+    def set_total(self, n_surrogates):
+        self.total = int(n_surrogates)
+        self._draw()
+
+    def update_surrogate(self, pair_key_str, current, total):
+        try:
+            frac = float(current) / float(total)
+        except Exception:
+            frac = 0.0
+        if pair_key_str in self.progress:
+            self.progress[pair_key_str] = min(1.0, max(0.0, frac))
+        self._draw()
+
+    def mark_pair_done(self, pair_key_str):
+        if pair_key_str in self.progress:
+            self.progress[pair_key_str] = 1.0
+        self._draw()
+
+    def _draw(self):
+        try:
+            import matplotlib.pyplot as plt
+            labels = list(self.progress.keys())
+            vals = [self.progress[k] for k in labels]
+            y = np.arange(len(labels))
+            fig, ax = plt.subplots(figsize=(6, max(2, 0.3 * len(labels))))
+            ax.barh(y, vals, color='C0')
+            ax.set_xlim(0, 1)
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels, fontsize=8)
+            ax.set_xlabel('Progress')
+            for i, v in enumerate(vals):
+                ax.text(v + 0.02, i, f"{int(v*100)}%", va='center', fontsize=8)
+            plt.tight_layout()
+            fig.savefig(self.png_path, dpi=150)
+            plt.close(fig)
+        except Exception:
+            # silently ignore plotting errors (progress is auxiliary)
+            pass
+
+
+def benjamini_hochberg(pvals, alpha=0.05):
+    """Benjamini-Hochberg FDR correction for a 2D p-value matrix.
+    Returns boolean mask of significant entries (same shape as pvals).
+    """
+    p = pvals.flatten()
+    n = p.size
+    order = np.argsort(p)
+    sorted_p = p[order]
+    thresh = (np.arange(1, n+1) / n) * alpha
+    below = sorted_p <= thresh
+    if not np.any(below):
+        return np.zeros_like(pvals, dtype=bool)
+    max_idx = np.max(np.where(below)[0])
+    cutoff = sorted_p[max_idx]
+    sig_mask = pvals <= cutoff
+    return sig_mask
+
+
+def surrogate_psi_test_for_pair(
+    data,
+    sfreq,
+    pair_key,
+    band_list,
+    n_surrogates=200,
+    cycles=6,
+    overlap=0.5,
+    m_max_extra=3,
+    min_win_sec=0.5,
+    max_win_sec=10.0,
+    random_state=None,
+    alpha=0.05,
+    verbose=True,
+    show_progress=False,
+    progress_position=0,
+    progress_plotter=None,
+    progress_key=None,
+    n_jobs=1,
+    chunk_size=10,
+    save_surrogates=False,
+):
+    """Perform phase-randomization surrogate test for PSI mean matrix of a band pair.
+
+    This implementation parallelizes surrogate generation in chunks and accumulates
+    counts of how often each surrogate >= observed to compute p-values without
+    keeping the full surrogate set in memory. Use `n_jobs` (joblib loky backend)
+    and `chunk_size` to tune parallel efficiency. If `save_surrogates` is True,
+    a (potentially large) array of surrogates will be returned; otherwise None.
+    """
+    import time
+    rng = np.random.default_rng(random_state)
+
+    b1, b2 = pair_key
+    if b1 not in BAND_DEFS or b2 not in BAND_DEFS:
+        raise ValueError("pair_key must be band names defined in BAND_DEFS")
+
+    band_bounds_local = {b: BAND_DEFS[b] for b in band_list}
+    band_fc = {b: center_freq(band_bounds_local[b]) for b in band_list}
+    band_win = {b: window_length_from_cycles(band_fc[b], cycles, min_win_sec, max_win_sec)
+                for b in band_list}
+
+    # choose window length
+    if b1 == b2:
+        win_sec = band_win[b1]
+    else:
+        win_sec = max(band_win[b1], band_win[b2])
+
+    step_sec = win_sec * (1.0 - overlap)
+    n_ch, n_times = data.shape
+    step_samples = int(round(step_sec * sfreq)) if step_sec > 0 else 0
+    win_samples = int(round(win_sec * sfreq))
+
+    n_win = int(np.floor((n_times / sfreq - win_sec) / step_sec) + 1) if step_sec > 0 else 1
+    if n_win < 1:
+        n_win = 1
+
+    if verbose:
+        print(f"Surrogate test for pair {pair_key}: win {win_sec:.3f}s step {step_sec:.3f}s n_win {n_win} n_surrogates {n_surrogates} n_jobs {n_jobs} chunk_size {chunk_size}")
+
+    # filter original data per band (use same fir_filter_data)
+    l1, h1 = BAND_DEFS[b1]
+    l2, h2 = BAND_DEFS[b2]
+    filt1 = fir_filter_data(data, sfreq, l1, h1)
+    filt2 = fir_filter_data(data, sfreq, l2, h2)
+
+    # compute observed psi_mean following same algorithm as compute_dynamic_measures for this pair
+    psi_windows = np.zeros((n_win, n_ch, n_ch))
+    for w in range(n_win):
+        start = int(w * step_samples)
+        end = start + win_samples
+        if end > n_times:
+            start = max(0, n_times - win_samples)
+            end = n_times
+        x1 = filt1[:, start:end]
+        x2 = filt2[:, start:end]
+        a1 = hilbert(x1, axis=1)
+        a2 = hilbert(x2, axis=1)
+        ph1 = np.angle(a1)
+        ph2 = np.angle(a2)
+
+        if b1 == b2:
+            for i in range(n_ch):
+                for j in range(n_ch):
+                    psi_windows[w, i, j] = psi_between_phase(ph1[i], ph2[j])
+        else:
+            f1c = band_fc[b1]
+            f2c = band_fc[b2]
+            if f1c == 0:
+                m_max = 1
+            else:
+                m_max = int(np.ceil(f2c / f1c)) + m_max_extra
+                if m_max < 1:
+                    m_max = 1
+            for i in range(n_ch):
+                for j in range(n_ch):
+                    best_psi = -1.0
+                    for m in range(1, m_max + 1):
+                        phase_diff = 1 * ph2[j] - m * ph1[i]
+                        psi_val = np.abs(np.mean(np.exp(1j * phase_diff)))
+                        if psi_val > best_psi:
+                            best_psi = psi_val
+                    psi_windows[w, i, j] = best_psi
+
+    observed_mean = np.mean(psi_windows, axis=0)
+
+    # Prepare seeds for reproducible per-surrogate RNG
+    seeds = [int(rng.integers(1_000_000_000)) for _ in range(n_surrogates)]
+
+    # accumulator for counts of surrogate >= observed (one-sided test)
+    counts = np.zeros((n_ch, n_ch), dtype=np.int64)
+
+    # optional container for saved surrogates
+    surrogates_saved = [] if save_surrogates else None
+
+    # helper: compute one surrogate psi_mean given seed
+    def _compute_one_surrogate(seed):
+        # phase-randomize
+        data_surr = phase_randomize_signals(data, random_state=seed)
+        # filter
+        filt1_s = fir_filter_data(data_surr, sfreq, l1, h1)
+        filt2_s = fir_filter_data(data_surr, sfreq, l2, h2)
+        # compute windows mean
+        psi_w_s = np.zeros((n_win, n_ch, n_ch))
+        for w in range(n_win):
+            start = int(w * step_samples)
+            end = start + win_samples
+            if end > n_times:
+                start = max(0, n_times - win_samples)
+                end = n_times
+            x1 = filt1_s[:, start:end]
+            x2 = filt2_s[:, start:end]
+            a1 = hilbert(x1, axis=1)
+            a2 = hilbert(x2, axis=1)
+            ph1 = np.angle(a1)
+            ph2 = np.angle(a2)
+
+            if b1 == b2:
+                for i in range(n_ch):
+                    for j in range(n_ch):
+                        psi_w_s[w, i, j] = psi_between_phase(ph1[i], ph2[j])
+            else:
+                f1c = band_fc[b1]
+                f2c = band_fc[b2]
+                if f1c == 0:
+                    m_max = 1
+                else:
+                    m_max = int(np.ceil(f2c / f1c)) + m_max_extra
+                    if m_max < 1:
+                        m_max = 1
+                for i in range(n_ch):
+                    for j in range(n_ch):
+                        best_psi = -1.0
+                        for m in range(1, m_max + 1):
+                            phase_diff = 1 * ph2[j] - m * ph1[i]
+                            psi_val = np.abs(np.mean(np.exp(1j * phase_diff)))
+                            if psi_val > best_psi:
+                                best_psi = psi_val
+                        psi_w_s[w, i, j] = best_psi
+        return np.mean(psi_w_s, axis=0)
+
+    # run surrogates in chunks to avoid keeping all surrogates in memory
+    import time
+    t0 = time.time()
+    for start in range(0, n_surrogates, chunk_size):
+        end = min(n_surrogates, start + chunk_size)
+        seed_chunk = seeds[start:end]
+        # parallel compute per-chunk
+        results = Parallel(n_jobs=n_jobs, backend='loky')(
+            delayed(_compute_one_surrogate)(s) for s in seed_chunk
+        )
+        # update counts and optionally save
+        for psi_s in results:
+            counts += (psi_s >= observed_mean).astype(np.int64)
+            if save_surrogates:
+                surrogates_saved.append(psi_s)
+        if verbose:
+            done = end
+            print(f"  processed {done}/{n_surrogates} surrogates (elapsed {time.time()-t0:.1f}s)")
+        # update progress plot if available
+        if progress_plotter is not None and progress_key is not None:
+            try:
+                progress_plotter.update_surrogate(progress_key, min(n_surrogates, end), n_surrogates)
+            except Exception:
+                pass
+
+    # build p-values (one-sided)
+    p_matrix = (counts + 1.0) / (n_surrogates + 1.0)
+
+    # FDR correction
+    sig_mask = benjamini_hochberg(p_matrix, alpha=alpha)
+
+    # convert saved surrogates list to array if requested
+    surrogates_array = None
+    if save_surrogates and len(surrogates_saved) > 0:
+        surrogates_array = np.stack(surrogates_saved, axis=0)
+
+    return observed_mean, p_matrix, sig_mask, surrogates_array
+def run_surrogate_and_plot_for_subject(args, subject_id, condition, data, sfreq, results, ch_names, n_surrogates=500):
+    """For a given subject and condition, run surrogate tests for selected band pairs
+    (controlled by args.same_band_only) and produce connectivity circle plots for
+    significant connections only. Processing is parallelized across band pairs using joblib.
+
+    Saves observed, p-values, sig mask, optional surrogates, and PNG circle plots
+    under args.pair_result_path/<subject_id>/.
+    """
+    out_dir = os.path.join(args.pair_result_path, subject_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # determine pairs to run according to args.same_band_only
+    band_list = getattr(args, 'band_list', ["delta","theta","alpha","beta"]) if hasattr(args, 'band_list') else ["delta","theta","alpha","beta"]
+    same_band_only = getattr(args, 'same_band_only', True)
+
+    pairs = []
+    if same_band_only:
+        pairs = [(b, b) for b in band_list]
+    else:
+        for i, b1 in enumerate(band_list):
+            for b2 in band_list[i:]:
+                pairs.append((b1, b2))
+
+    # joblib parallel settings
+    n_jobs = getattr(args, 'n_jobs', 4)  # -1 = use all cores by default
+    backend = getattr(args, 'parallel_backend', 'loky')
+
+    # optional visual progress
+    show_progress_plot = getattr(args, 'show_progress_plot', False)
+    progress_plotter = ProgressPlotter(out_dir, pairs) if show_progress_plot else None
+
+    def _process_pair(pair_key, show_progress=False, progress_position=0, progress_plotter=None, progress_key=None):
+        try:
+            if getattr(args, 'verbose', False):
+                print(f"Surrogate+plot for {subject_id} {condition} pair {pair_key}")
+
+            observed_mean, p_matrix, sig_mask, surrogates = surrogate_psi_test_for_pair(
+                data, sfreq, pair_key, band_list,
+                n_surrogates=n_surrogates,
+                cycles=getattr(args, 'cycles', 6),
+                overlap=getattr(args, 'overlap', 0.5),
+                m_max_extra=getattr(args, 'm_max_extra', 3),
+                min_win_sec=getattr(args, 'min_win_sec', 0.5),
+                max_win_sec=getattr(args, 'max_win_sec', 10.0),
+                random_state=getattr(args, 'random_state', None),
+                alpha=getattr(args, 'alpha', 0.05),
+                verbose=getattr(args, 'verbose', False),
+                show_progress=show_progress,
+                progress_position=progress_position,
+                progress_plotter=progress_plotter,
+                progress_key=progress_key
+            )
+
+            # Only keep significant connections
+            adj_sig = np.where(sig_mask, observed_mean, 0.0)
+
+            # Save matrices
+            base = f"surrogate_{pair_key[0]}_{pair_key[1]}_{subject_id}_{condition}"
+            np.save(os.path.join(out_dir, f"{base}_observed.npy"), observed_mean)
+            np.save(os.path.join(out_dir, f"{base}_p.npy"), p_matrix)
+            np.save(os.path.join(out_dir, f"{base}_sigmask.npy"), sig_mask)
+            if getattr(args, 'save_surrogates', False):
+                np.save(os.path.join(out_dir, f"{base}_samples.npy"), surrogates)
+
+            # Create connectivity circle plot for significant edges only
+            try:
+                vmax = np.max(np.abs(observed_mean))
+                if vmax == 0:
+                    vmax = 1.0
+                # use plot_connectivity_circle from mne_connectivity.viz (imported as plot_connectivity_circle)
+                fig = plot_connectivity_circle(
+                    adj_sig, ch_names, title=f"{subject_id} {condition} {pair_key} (sig only)",
+                    colormap='hot', vmin=0.0, vmax=vmax, show=False
+                )
+                img_path = os.path.join(out_dir, f"connectivity_circle_{pair_key[0]}_{pair_key[1]}_{subject_id}_{condition}.png")
+                try:
+                    fig.savefig(img_path, dpi=300)
+                    plt.close(fig)
+                except Exception:
+                    plt.savefig(img_path, dpi=300)
+                    plt.close()
+                if getattr(args, 'verbose', False):
+                    print(f"Saved connectivity circle to {img_path}")
+            except Exception as e:
+                print(f"Failed to plot connectivity circle for {pair_key}: {e}")
+
+            # return results to attach in main results dict
+            return (pair_key, observed_mean, p_matrix, sig_mask)
+
+        except Exception as e:
+            print(f"Surrogate test/plot failed for {subject_id} {condition} pair {pair_key}: {e}")
+            return (pair_key, None, None, None)
+
+    # If running single-job (n_jobs == 1), run serially so we can show per-surrogate tqdm bars
+    processed = []
+    if n_jobs == 1:
+        if getattr(args, 'verbose', False):
+            print("Running surrogate tests serially (n_jobs=1) — per-surrogate progress bars enabled.")
+        for idx, pk in enumerate(pairs):
+            # use a fixed progress_position so bars are placed below outer loop
+            progress_key = f"{pk[0]}-{pk[1]}" if progress_plotter is not None else None
+            res = _process_pair(pk, show_progress=True, progress_position=1, progress_plotter=progress_plotter, progress_key=progress_key)
+            processed.append(res)
+    else:
+        if getattr(args, 'verbose', False):
+            print("Running surrogate tests in parallel — per-surrogate tqdm disabled. Use n_jobs=1 to enable detailed progress.")
+        # Run tasks in a ThreadPoolExecutor so we can show a simple per-pair progress bar
+        if getattr(args, 'verbose', False):
+            print("Running surrogate tests in parallel — showing per-pair progress (threads used).")
+
+        # determine number of workers
+        if n_jobs == -1:
+            max_workers = os.cpu_count() or 1
+        else:
+            max_workers = max(1, int(n_jobs))
+
+        processed = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # submit all pair tasks
+            future_to_pair = {executor.submit(_process_pair, pk): pk for pk in pairs}
+            # iterate as they complete and update a simple tqdm counter
+            for fut in tqdm(concurrent.futures.as_completed(future_to_pair),
+                            total=len(future_to_pair), desc="pairs", unit="pair", disable=not getattr(args, 'verbose', False)):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    pk = future_to_pair.get(fut)
+                    print(f"Error processing pair {pk}: {e}")
+                    res = (pk, None, None, None)
+                processed.append(res)
+                # update progress plot per-pair (parallel case)
+                if progress_plotter is not None:
+                    try:
+                        pair_key = future_to_pair.get(fut)
+                        if pair_key is not None:
+                            progress_plotter.mark_pair_done(f"{pair_key[0]}-{pair_key[1]}")
+                    except Exception:
+                        pass
+
+    # attach to results and save per-pair files
+    for pair_key, observed_mean, p_matrix, sig_mask in processed:
+        if observed_mean is None:
+            continue
+        # ensure container exists
+        if pair_key not in results.get('per_pair', {}):
+            results.setdefault('per_pair', {})[pair_key] = {}
+        results['per_pair'][pair_key]['surrogate_observed'] = observed_mean
+        results['per_pair'][pair_key]['surrogate_p'] = p_matrix
+        results['per_pair'][pair_key]['surrogate_sigmask'] = sig_mask
+
+    # save per-pair summary
+    summary_path = os.path.join(out_dir, f"per_pair_results_{subject_id}_{condition}.pkl")
+    with open(summary_path, 'wb') as sf:
+        pickle.dump(results.get('per_pair', {}), sf)
+    print(f"Saved per-pair summary to {summary_path}")
 
 def run_psi_2(args):
+    """Compute dynamic PSI/PLI/wPLI/imcoh for all subjects and optionally run surrogates.
 
-    subject_ids = get_subject_ids(args.preprocess_path)    
+    Behavior:
+      - Iterates subjects from args.preprocess_path (via get_subject_ids)
+      - For each subject/condition, loads preprocessed raw .fif, picks EEG channels
+      - Applies compute_csd (same as compute_psi_matrix did)
+      - Calls compute_dynamic_measures(...) to compute per-pair windowed and mean metrics
+      - Saves the full results dict to args.pair_result_path/<subject_id>/dynamic_results_<id>_<condition>.pkl
+      - If args.n_surrogates > 0, calls run_surrogate_and_plot_for_subject(...) to run surrogate testing
 
-    for id in tqdm(subject_ids, desc="Connectivity Subjects"):
+    Notes:
+      - This function expects args to provide at least: preprocess_path, pair_result_path
+      - Surrogate-related options are read from args and forwarded to the surrogate runner.
+    """
+    subject_ids = get_subject_ids(args.preprocess_path)
+
+    for subject_id in tqdm(subject_ids, desc="Connectivity Subjects (dynamic)"):
         for condition in ['EO', 'EC']:
-            print(f"==={id}_{condition}===")
-            # Define the paths to the raw EEG files
-            path = os.path.join(args.preprocess_path, id, f"{id}_{condition}_eeg.fif")
-
-            # Load the raw data
+            print(f"==={subject_id}_{condition}===")
+            # Load raw file
+            path = os.path.join(args.preprocess_path, subject_id, f"{subject_id}_{condition}_eeg.fif")
             if not os.path.exists(path):
                 print(f"Raw EEG file for condition {condition} does not exist: {path}")
                 continue
-            # Load the raw data   
-            raw = mne.io.read_raw_fif(path, preload=True)
-            # if not raw.preload:
-            #     raw.load_data()
 
-            data = raw.get_data()  # shape: (n_channels, n_times)
+            try:
+                raw = mne.io.read_raw_fif(path, preload=True)
+            except Exception as e:
+                print(f"Failed to read raw file {path}: {e}")
+                continue
 
-            sfreq = raw.info["sfreq"]
+            # pick EEG channels
+            try:
+                raw.pick('eeg')
+            except Exception:
+                # if pick fails, continue with raw as-is
+                pass
 
-            band_list = ["delta", "theta", "alpha", "beta"]
-            results = compute_dynamic_measures(
-            args,
-            id,
-            condition,
-            data=data,
-            sfreq=sfreq,
-            band_list=band_list,
-            cycles=6,
-            overlap=0.5,
-            verbose=True
-            )
+            # apply compute_csd if available (keeps behavior consistent with compute_psi_matrix)
+            try:
+                raw = compute_csd(raw)
+            except Exception as e:
+                if getattr(args, 'verbose', False):
+                    print(f"compute_csd failed or skipped for {subject_id} {condition}: {e}")
 
+            # prepare data array for dynamic measures
+            try:
+                data = raw.get_data()  # shape (n_channels, n_times)
+                sfreq = raw.info.get('sfreq', None)
+                ch_names = raw.ch_names
+            except Exception as e:
+                print(f"Failed to extract data from raw for {subject_id} {condition}: {e}")
+                continue
 
-# def estimate_m_range(phase1_band, phase2_band):
-#     """
-#     Estimate the range of m such that m * phase1_freq approximates phase2_freq.
-#     Inputs are tuples representing frequency bands, e.g., (0.5, 4) for delta.
-#     Returns integer m_min and m_max.
-#     """
-#     f1_min, f1_max = phase1_band
-#     f2_min, f2_max = phase2_band
+            # compute dynamic measures
+            try:
+                results = compute_dynamic_measures(
+                    args=args,
+                    id=subject_id,
+                    condition=condition,
+                    data=data,
+                    sfreq=sfreq,
+                    ch_names=ch_names,
+                    band_list=getattr(args, 'band_list', ["delta", "theta", "alpha", "beta"]),
+                    cycles=getattr(args, 'cycles', 6),
+                    overlap=getattr(args, 'overlap', 0.5),
+                    m_max_extra=getattr(args, 'm_max_extra', 3),
+                    min_win_sec=getattr(args, 'min_win_sec', 0.5),
+                    max_win_sec=getattr(args, 'max_win_sec', 10.0),
+                    verbose=getattr(args, 'verbose', False)
+                )
+            except Exception as e:
+                print(f"Failed compute_dynamic_measures for {subject_id} {condition}: {e}")
+                continue
 
-#     # Avoid division by zero
-#     if f1_max == 0 or f1_min == 0:
-#         raise ValueError("Frequency band includes 0 Hz, which is invalid.")
+            # save dynamic results per subject/condition
+            out_dir = os.path.join(args.pair_result_path, subject_id)
+            os.makedirs(out_dir, exist_ok=True)
+            dyn_path = os.path.join(out_dir, f"dynamic_results_{subject_id}_{condition}.pkl")
+            try:
+                with open(dyn_path, 'wb') as f:
+                    pickle.dump(results, f)
+                if getattr(args, 'verbose', False):
+                    print(f"Saved dynamic results to {dyn_path}")
+            except Exception as e:
+                print(f"Failed to save dynamic results for {subject_id} {condition}: {e}")
 
-#     m_min = round(np.floor(f2_min / f1_max))  # e.g. phase1 maxが4Hz, phase2 minが4Hzなら m_min = 1
-#     m_max = round(np.ceil(f2_max / f1_min))   # e.g. phase1 minが0.5Hz, phase2 maxが8Hzなら m_max = 16
+            # Optionally run surrogates if requested
+            n_surrogates = getattr(args, 'n_surrogates', 0)
+            if n_surrogates and int(n_surrogates) > 0:
+                if getattr(args, 'verbose', False):
+                    print(f"Running surrogate tests (n_surrogates={n_surrogates}) for {subject_id} {condition}")
+                try:
+                    run_surrogate_and_plot_for_subject(
+                        args=args,
+                        subject_id=subject_id,
+                        condition=condition,
+                        data=data,
+                        sfreq=sfreq,
+                        results=results,
+                        ch_names=ch_names,
+                        n_surrogates=int(n_surrogates)
+                    )
+                except Exception as e:
+                    print(f"Surrogate runner failed for {subject_id} {condition}: {e}")
 
-#     # Ensure m_min is at least 1
-#     m_min = max(1, m_min)
-
-#     return m_min, m_max
-
-# def find_best_m_for_n1(phase1, phase2, m_range=(1, 10), plot=False):
-#     """
-#     Find the best m value for fixed n=1 that maximizes phase-locking value (PLV)
+    print("run_psi_2 finished.")
     
-#     Parameters:
-#         phase1 (ndarray): Phase time series of the low-frequency signal
-#         phase2 (ndarray): Phase time series of the high-frequency signal
-#         m_range (tuple): Range of m values to test (min, max), inclusive
-    
-#     Returns:
-#         best_m (int): Value of m with highest PLV for n=1
-#         psi_values (ndarray): PSI values for each m in the given range
-#     """
-#     n = 1
-#     #m_vals = np.arange(m_range[0], m_range[1] + 0.1, 0.1)
-#     m_vals = np.arange(m_range[0], m_range[1] + 1, 1)
-#     psi_values = []
-
-#     for m in tqdm(m_vals, desc="Searching best m", leave=False):
-#         # Compute phase difference for n=1:m
-#         phase_diff = n * phase2 - m * phase1
-#         # Compute PSI for the current m
-#         psi = np.abs(np.mean(np.exp(1j * phase_diff)))
-#         psi_values.append(psi)
-
-#     psi_values = np.array(psi_values)
-#     best_psi = np.argmax(psi_values)
-#     best_m = m_vals[best_psi]
-
-#     # Plot the results
-#     if plot:
-#         plt.figure(figsize=(8, 5))
-#         plt.plot(m_vals, psi_values, marker='o')
-#         plt.title('Phase Synchronization Index (PSI) for n=1 and varying m')
-#         plt.xlabel('m (harmonic of wave)')
-#         plt.ylabel('Phase Synchronization Index (PSI)')
-#         plt.grid(True)
-#         plt.tight_layout()
-#         plt.show()
-
-#     return best_m, best_psi
-
-# def get_phase(args, raw1, raw2, f1, f2, method='wavelet'):
-#     """    Extract phase information from two raw EEG datasets using either Hilbert transform or wavelet transform. 
-#     Parameters:
-#         raw1 (mne.io.Raw): First raw EEG dataset.
-#         raw2 (mne.io.Raw): Second raw EEG dataset.
-#         f1 (tuple): Frequency band for the first dataset (e.g., theta).
-#         f2 (tuple): Frequency band for the second dataset (e.g., alpha).
-#         method (str): Method to use for phase extraction ('hilbert' or 'wavelet').
-#     Returns:
-#         phase1 (ndarray): Phase of the first dataset, shape: (n_channels, n_times).
-#         phase2 (ndarray): Phase of the second dataset, shape: (n_channels, n_times).
-#     """
-#     if method == 'hilbert':
-#         phase1 = np.angle(hilbert(raw1.get_data(), axis=1))
-#         phase2 = np.angle(hilbert(raw2.get_data(), axis=1))
-#     elif method == 'wavelet':
-    
-#         epochs1 = create_epochs(raw1, args.epoch_duration)
-#         epochs2 = create_epochs(raw2, args.epoch_duration)
-
-#         freqs1 = np.linspace(f1[0], f1[1], 5)
-#         freqs2 = np.linspace(f2[0], f2[1], 5)
-
-#         # Phase1 extraction
-#         phase1 = tfr_array_morlet(epochs1, sfreq=raw1.info['sfreq'],
-#                                   freqs=freqs1, n_cycles=freqs1 / 2, output='phase')[0]
-#         phase1 = np.mean(phase1, axis=1)  # shape: (n_channels, n_times)
-
-#         # Phase2 extraction
-#         phase2 = tfr_array_morlet(epochs2, sfreq=raw2.info['sfreq'],
-#                                   freqs=freqs2, n_cycles=freqs2 / 2, output='phase')[0]
-#         phase2 = np.mean(phase2, axis=1)
-#     else:
-#         raise ValueError("method must be 'hilbert' or 'wavelet'")
-    
-#     return phase1, phase2
-
-# def plot_save_psi_matrix(psi_matrix, id, condition, best_m, band1, band2, output_path):
-#     """
-#     Plot the n:m Phase Synchronization Index (PSI) matrix and save it as an image.
-#     Parameters:
-#         psi_matrix (ndarray): n:m Phase Synchronization Index matrix, shape: (n_channels, n_channels).
-#         id (str): Subject ID.
-#         condition (str): Condition label (e.g., 'EO', 'EC').
-#         best_m (int): Best m value found for the n:m coupling.
-#         f1 (str): Name of the first frequency band (e.g., 'delta').
-#         f2 (str): Name of the second frequency band (e.g., 'delta').
-#         output_path (str): Path to save the output image.
-#     """
-
-#     plt.figure(figsize=(6, 5))
-#     plt.imshow(psi_matrix, cmap='plasma', interpolation='nearest')
-#     plt.colorbar(label='n:m Phase Synchronization Index (PSI)')
-#     plt.title(f'1:{best_m} Phase Synchronization Index ({band1} Hz & {band2} Hz)')
-#     plt.xlabel('Channel j (Phase2)')
-#     plt.ylabel('Channel i (Phase1)')
-#     plt.tight_layout()
-    
-#     subject_dir = os.path.join(output_path, id)
-
-#     # Ensure the output directory exists
-#     os.makedirs(os.path.dirname(subject_dir), exist_ok=True)
-    
-#     # Save the figure
-#     img_filename = os.path.join(subject_dir, f"{id}_{condition}.png")
-
-#     plt.savefig(img_filename, dpi=300)
-#     plt.close()
-#     print(f"Saved PSI matrix plot to {img_filename}")
-
-
-# def compute_nm_phase_phase_matrix(args, raw, id, condition, band1, band2, method='wavelef', simulate=False):
-#     """
-#     Compute n:m Phase Synchronization Index between all pairs of EEG channels.
-
-#     Parameters:
-#     -----------
-#     args : argparse.Namespace
-#         Contains paths and parameters.
-#     raw : mne.io.Raw
-#         Raw EEG data (preprocessed).
-#     id : str
-#         Subject ID (e.g., 'sub-010002').
-#     condition : str
-#         Condition label (e.g., 'EO', 'EC').
-#     band1 : str
-#         Name of the first frequency band (e.g., 'delta').
-#     band2 : str
-#         Name of the second frequency band (e.g., 'delta').
-#     method : str
-#         'hilbert' or 'wavelet'
-#     simulate : bool
-#         If True, simulate n:m phase coupling for a range of m values.
-#     Returns:
-#     --------
-#     phase_phase_matrix : np.ndarray, shape (n_channels, n_channels)
-#         Matrix of n:m Phase Synchronization Index (PSI).
-#     """
-
-#     bands = {
-#     'delta': (0.5, 4),
-#     'theta': (4, 8),
-#     'alpha': (8, 13),
-#     'beta': (13, 30),
-#     'low_gamma': (30, 50),
-#     'mid_gamma': (50, 80),
-#     'high_gamma': (80, 100)
-#     }
-
-#     # Bandpass filtering
-#     f1 = bands[band1]
-#     f2 = bands[band2]
-#     raw1 = raw.copy().filter(f1[0], f1[1], method='iir', verbose=False)
-#     raw2 = raw.copy().filter(f2[0], f2[1], method='iir', verbose=False)
-
-#     # Compute CSD for both bands
-#     raw1 = compute_csd(raw1)
-#     raw2 = compute_csd(raw2)
-
-#     # Get phase information
-#     phase1, phase2 = get_phase(args, raw1, raw2, f1, f2, method=method)
-
-#     # Initialize the phase-phase matrix
-#     n_channels = phase1.shape[0]
-#     psi_matrix = np.zeros((n_channels, n_channels))
-
-#     if simulate:
-#         m_min, m_max = estimate_m_range(f1, f2)
-#     else:
-#         n = 1
-#         m = 1
-
-#     # Compute n:m phase-phase coupling for each channel pair
-#     for i in tqdm(range(n_channels), desc=f"Computing PSI ({id}, {condition})", leave=True):
-#         for j in range(n_channels):
-#             if simulate:
-#                 # Simulate n:m phase coupling
-#                 best_m, best_psi = find_best_m_for_n1(phase1[i], phase2[j], m_range=(m_min, m_max))
-#                 psi_matrix[i, j] = best_psi
-
-#             else:
-#                 phase_diff = n * phase2 - m * phase1
-#                 # Compute PSI for the current m
-#                 psi = np.abs(np.mean(np.exp(1j * phase_diff)))
-#                 psi_matrix[i, j] = psi
-
-#     psi_matrix = np.array(psi_matrix)
-#     psi_matrix = np.mean(psi_matrix, axis=0)
-
-#     # Save the matrix to a file
-#     save_psi_matrix(psi_matrix, id, condition, args.psi_path)
-
-#     plot_save_psi_matrix(psi_matrix, id, condition, best_m, band1, band2, args.psi_path)
-
-    
-#     return psi_matrix
